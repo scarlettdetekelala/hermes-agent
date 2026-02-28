@@ -487,7 +487,59 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
-    
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """
+        Send a file as a native document attachment via the platform API.
+
+        Override in subclasses to send files as proper attachments
+        (Telegram documents, Discord file uploads, Slack file shares).
+        Default falls back to sending the file path as a text message.
+        """
+        text = f"📎 Document: {file_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
+    @staticmethod
+    def extract_documents(content: str) -> Tuple[List[Tuple[str, str]], str]:
+        """
+        Extract DOCUMENT:<path> tags from response text.
+
+        The send_message tool (or agent responses) may include tags like:
+            DOCUMENT:/path/to/report.pdf
+            DOCUMENT:/path/to/file.xlsx|Optional caption here
+
+        Args:
+            content: The response text to scan.
+
+        Returns:
+            Tuple of (list of (path, caption) pairs, cleaned content with tags removed).
+        """
+        documents: List[Tuple[str, str]] = []
+        cleaned = content
+
+        # Match DOCUMENT:<path> or DOCUMENT:<path>|<caption>
+        doc_pattern = r'DOCUMENT:(\S+?)(?:\|([^\n]+))?(?:\s|$)'
+        for match in re.finditer(doc_pattern, content):
+            path = match.group(1).strip()
+            caption = (match.group(2) or "").strip()
+            if path:
+                documents.append((path, caption))
+
+        # Remove DOCUMENT tags from content
+        if documents:
+            cleaned = re.sub(doc_pattern, '', cleaned)
+            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+        return documents, cleaned
+
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
@@ -601,6 +653,9 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                # Extract DOCUMENT:<path> tags before other processing
+                document_files, response = self.extract_documents(response)
+
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 
@@ -659,7 +714,25 @@ class BasePlatformAdapter(ABC):
                             print(f"[{self.name}] Failed to send voice: {voice_result.error}")
                     except Exception as voice_err:
                         print(f"[{self.name}] Error sending voice: {voice_err}")
-            
+
+                # Send extracted document files as native attachments
+                for doc_path, doc_caption in document_files:
+                    if human_delay > 0:
+                        await asyncio.sleep(human_delay)
+                    try:
+                        if not os.path.exists(doc_path):
+                            print(f"[{self.name}] Document not found: {doc_path}")
+                            continue
+                        doc_result = await self.send_document(
+                            chat_id=event.source.chat_id,
+                            file_path=doc_path,
+                            caption=doc_caption if doc_caption else None,
+                        )
+                        if not doc_result.success:
+                            print(f"[{self.name}] Failed to send document: {doc_result.error}")
+                    except Exception as doc_err:
+                        print(f"[{self.name}] Error sending document: {doc_err}")
+
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
