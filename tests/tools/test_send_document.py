@@ -92,7 +92,8 @@ class TestFilePathValidation:
         assert "not a file" in result.lower()
 
     def test_validate_existing_file_ok(self):
-        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        # /tmp is in trusted dirs by default
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, dir="/tmp") as f:
             f.write(b"test content")
             f.flush()
             try:
@@ -100,6 +101,29 @@ class TestFilePathValidation:
                 assert result is None  # No error
             finally:
                 os.unlink(f.name)
+
+    def test_validate_file_outside_trusted_dirs(self):
+        # Create a file outside trusted dirs
+        test_dir = tempfile.mkdtemp(prefix="untrusted_")
+        test_file = os.path.join(test_dir, "secret.txt")
+        try:
+            with open(test_file, "w") as f:
+                f.write("secret data")
+            # /tmp is trusted, but /var/folders (macOS tmpdir) may resolve there
+            # Use a path that's definitely outside trusted dirs
+            import shutil
+            untrusted_dir = os.path.join(os.path.expanduser("~"), ".untrusted_test_dir")
+            os.makedirs(untrusted_dir, exist_ok=True)
+            untrusted_file = os.path.join(untrusted_dir, "secret.txt")
+            with open(untrusted_file, "w") as f:
+                f.write("secret")
+            result = _validate_file_path(untrusted_file)
+            assert result is not None
+            assert "trusted" in result.lower()
+            os.unlink(untrusted_file)
+            os.rmdir(untrusted_dir)
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
 
 
 # ── send_message_tool Integration Tests ──────────────────────────────────
@@ -178,6 +202,46 @@ class TestExtractDocuments:
         docs, cleaned = BasePlatformAdapter.extract_documents(content)
         assert len(docs) == 1
         assert "\n\n\n" not in cleaned
+
+    def test_extract_document_path_with_spaces(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        content = "DOCUMENT:/tmp/my report.pdf|Quarterly report"
+        docs, cleaned = BasePlatformAdapter.extract_documents(content)
+        assert len(docs) == 1
+        assert docs[0][0] == "/tmp/my report.pdf"
+        assert docs[0][1] == "Quarterly report"
+        assert "DOCUMENT:" not in cleaned
+
+    def test_extract_document_path_with_spaces_no_caption(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        content = "Here:\nDOCUMENT:/tmp/my report.pdf\nDone."
+        docs, cleaned = BasePlatformAdapter.extract_documents(content)
+        assert len(docs) == 1
+        assert docs[0][0] == "/tmp/my report.pdf"
+        assert docs[0][1] == ""
+
+
+# ── Trusted Document Path Tests ───────────────────────────────────────────
+
+class TestTrustedDocumentPath:
+    """Test the _is_trusted_document_path security function."""
+
+    def test_tmp_is_trusted(self):
+        from gateway.platforms.base import _is_trusted_document_path
+        assert _is_trusted_document_path("/tmp/test.pdf") is True
+
+    def test_hermes_dir_is_trusted(self):
+        from gateway.platforms.base import _is_trusted_document_path
+        hermes_path = os.path.expanduser("~/.hermes/document_cache/test.pdf")
+        assert _is_trusted_document_path(hermes_path) is True
+
+    def test_etc_passwd_is_not_trusted(self):
+        from gateway.platforms.base import _is_trusted_document_path
+        assert _is_trusted_document_path("/etc/passwd") is False
+
+    def test_root_file_is_not_trusted(self):
+        from gateway.platforms.base import _is_trusted_document_path
+        assert _is_trusted_document_path("/secret.key") is False
 
 
 # ── BasePlatformAdapter.send_document Fallback Test ──────────────────────
