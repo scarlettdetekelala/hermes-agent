@@ -36,7 +36,11 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send"
+                "description": "The message text to send. When file_path is also provided, this becomes the file caption."
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Local file path to send as a document attachment. The file must exist on disk. Can be combined with 'message' to add a caption."
             }
         },
         "required": []
@@ -63,12 +67,36 @@ def _handle_list():
         return json.dumps({"error": f"Failed to load channel directory: {e}"})
 
 
+def _validate_file_path(file_path: str) -> str | None:
+    """Validate and sanitize a file path. Returns error string or None if OK."""
+    if not file_path:
+        return None
+    # Reject path traversal — check raw input before normalization resolves it away
+    if ".." in file_path.split("/") or ".." in file_path.split(os.sep):
+        return "Path traversal detected: '..' components are not allowed"
+    if not os.path.exists(file_path):
+        return f"File not found: {file_path}"
+    if not os.path.isfile(file_path):
+        return f"Path is not a file: {file_path}"
+    return None
+
+
 def _handle_send(args):
-    """Send a message to a platform target."""
+    """Send a message or file to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
-    if not target or not message:
-        return json.dumps({"error": "Both 'target' and 'message' are required when action='send'"})
+    file_path = args.get("file_path", "")
+
+    if not target:
+        return json.dumps({"error": "'target' is required when action='send'"})
+    if not message and not file_path:
+        return json.dumps({"error": "At least one of 'message' or 'file_path' is required when action='send'"})
+
+    # Validate file path if provided
+    if file_path:
+        file_error = _validate_file_path(file_path)
+        if file_error:
+            return json.dumps({"error": file_error})
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -132,7 +160,7 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
-        result = _run_async(_send_to_platform(platform, pconfig, chat_id, message))
+        result = _run_async(_send_to_platform(platform, pconfig, chat_id, message, file_path=file_path or None))
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
@@ -140,8 +168,9 @@ def _handle_send(args):
         if isinstance(result, dict) and result.get("success"):
             try:
                 from gateway.mirror import mirror_to_session
+                mirror_text = message or f"[Document: {os.path.basename(file_path)}]" if file_path else message
                 source_label = os.getenv("HERMES_SESSION_PLATFORM", "cli")
-                if mirror_to_session(platform_name, chat_id, message, source_label=source_label):
+                if mirror_to_session(platform_name, chat_id, mirror_text, source_label=source_label):
                     result["mirrored"] = True
             except Exception:
                 pass
@@ -151,32 +180,48 @@ def _handle_send(args):
         return json.dumps({"error": f"Send failed: {e}"})
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message):
-    """Route a message to the appropriate platform sender."""
+async def _send_to_platform(platform, pconfig, chat_id, message, file_path=None):
+    """Route a message or file to the appropriate platform sender."""
     from gateway.config import Platform
     if platform == Platform.TELEGRAM:
-        return await _send_telegram(pconfig.token, chat_id, message)
+        return await _send_telegram(pconfig.token, chat_id, message, file_path=file_path)
     elif platform == Platform.DISCORD:
-        return await _send_discord(pconfig.token, chat_id, message)
+        return await _send_discord(pconfig.token, chat_id, message, file_path=file_path)
     elif platform == Platform.SLACK:
-        return await _send_slack(pconfig.token, chat_id, message)
+        return await _send_slack(pconfig.token, chat_id, message, file_path=file_path)
     return {"error": f"Direct sending not yet implemented for {platform.value}"}
 
 
-async def _send_telegram(token, chat_id, message):
+async def _send_telegram(token, chat_id, message, file_path=None):
     """Send via Telegram Bot API (one-shot, no polling needed)."""
     try:
         from telegram import Bot
+        from pathlib import Path
         bot = Bot(token=token)
-        msg = await bot.send_message(chat_id=int(chat_id), text=message)
-        return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(msg.message_id)}
+
+        if file_path:
+            with open(file_path, "rb") as f:
+                msg = await bot.send_document(
+                    chat_id=int(chat_id),
+                    document=f,
+                    filename=Path(file_path).name,
+                    caption=message[:1024] if message else None,
+                )
+            return {
+                "success": True, "platform": "telegram", "chat_id": chat_id,
+                "message_id": str(msg.message_id), "type": "document",
+                "filename": Path(file_path).name,
+            }
+        else:
+            msg = await bot.send_message(chat_id=int(chat_id), text=message)
+            return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(msg.message_id)}
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
         return {"error": f"Telegram send failed: {e}"}
 
 
-async def _send_discord(token, chat_id, message):
+async def _send_discord(token, chat_id, message, file_path=None):
     """Send via Discord REST API (no websocket client needed)."""
     try:
         import aiohttp
@@ -184,37 +229,103 @@ async def _send_discord(token, chat_id, message):
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
-        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
-        message_ids = []
-        async with aiohttp.ClientSession() as session:
-            for chunk in chunks:
-                async with session.post(url, headers=headers, json={"content": chunk}) as resp:
+        headers = {"Authorization": f"Bot {token}"}
+
+        if file_path:
+            from pathlib import Path
+            form = aiohttp.FormData()
+            form.add_field("content", message or "")
+            form.add_field(
+                "files[0]",
+                open(file_path, "rb"),
+                filename=Path(file_path).name,
+            )
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, data=form) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}
                     data = await resp.json()
-                    message_ids.append(data.get("id"))
-        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_ids": message_ids}
+                    return {
+                        "success": True, "platform": "discord", "chat_id": chat_id,
+                        "message_id": data.get("id"), "type": "document",
+                        "filename": Path(file_path).name,
+                    }
+        else:
+            headers["Content-Type"] = "application/json"
+            chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
+            message_ids = []
+            async with aiohttp.ClientSession() as session:
+                for chunk in chunks:
+                    async with session.post(url, headers=headers, json={"content": chunk}) as resp:
+                        if resp.status not in (200, 201):
+                            body = await resp.text()
+                            return {"error": f"Discord API error ({resp.status}): {body}"}
+                        data = await resp.json()
+                        message_ids.append(data.get("id"))
+            return {"success": True, "platform": "discord", "chat_id": chat_id, "message_ids": message_ids}
     except Exception as e:
         return {"error": f"Discord send failed: {e}"}
 
 
-async def _send_slack(token, chat_id, message):
+async def _send_slack(token, chat_id, message, file_path=None):
     """Send via Slack Web API."""
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        url = "https://slack.com/api/chat.postMessage"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={"channel": chat_id, "text": message}) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
-                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+        if file_path:
+            from pathlib import Path
+            # Step 1: Get upload URL
+            headers = {"Authorization": f"Bearer {token}"}
+            filename = Path(file_path).name
+            file_size = os.path.getsize(file_path)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://slack.com/api/files.getUploadURLExternal",
+                    headers=headers,
+                    params={"filename": filename, "length": str(file_size)},
+                ) as resp:
+                    url_data = await resp.json()
+                    if not url_data.get("ok"):
+                        return {"error": f"Slack upload URL failed: {url_data.get('error', 'unknown')}"}
+
+                upload_url = url_data["upload_url"]
+                file_id = url_data["file_id"]
+
+                # Step 2: Upload file content
+                with open(file_path, "rb") as f:
+                    async with session.post(upload_url, data=f) as resp:
+                        if resp.status not in (200, 201):
+                            return {"error": f"Slack file upload failed ({resp.status})"}
+
+                # Step 3: Complete upload and share to channel
+                async with session.post(
+                    "https://slack.com/api/files.completeUploadExternal",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={
+                        "files": [{"id": file_id, "title": filename}],
+                        "channel_id": chat_id,
+                        "initial_comment": message or "",
+                    },
+                ) as resp:
+                    complete_data = await resp.json()
+                    if complete_data.get("ok"):
+                        return {
+                            "success": True, "platform": "slack", "chat_id": chat_id,
+                            "file_id": file_id, "type": "document", "filename": filename,
+                        }
+                    return {"error": f"Slack complete upload failed: {complete_data.get('error', 'unknown')}"}
+        else:
+            url = "https://slack.com/api/chat.postMessage"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json={"channel": chat_id, "text": message}) as resp:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
+                    return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
     except Exception as e:
         return {"error": f"Slack send failed: {e}"}
 
